@@ -26,74 +26,87 @@ En el entorno educativo actual, la coordinación de asesorías académicas suele
 
 ## Integrantes
 
-- **Julian Pinto Uribe** — Entrada y captura de datos (menú, sesión, selección de materia y fecha)
-- **Heiling Leon** — Motor de asignación y confirmación (matching, registro, notificaciones)
+- **Julian Pinto Uribe** — Entrada y captura de datos (menú, sesión, selección de materia y fecha).
+- **Heiling Leon** — Motor de asignación y confirmación (matching, registro, notificaciones), integración final del workflow, recepción de mensajes, reportes y recordatorios automáticos.
 
 ## Arquitectura general
 
-El bot funciona como una máquina de estados: cada usuario tiene una fila en la hoja `SESSIONS` que indica en qué paso de la conversación está (`paso_actual`). Un nodo `Switch` (Router Paso) dirige el mensaje entrante al bloque de lógica correspondiente según ese paso.
+El bot funciona como una máquina de estados: cada usuario tiene una fila en la hoja `SESSIONS` que indica en qué paso de la conversación está (`paso_actual`). Un nodo `Switch` (**Router Paso**) dirige el mensaje entrante al bloque de lógica correspondiente según ese paso.
+
+**Nota sobre la recepción de mensajes:** en el diseño inicial se planteó usar un `Telegram Trigger` (webhook). En la implementación final se usa en su lugar un **polling programado cada 5 segundos**, porque el entorno de desarrollo corre en Docker local sin URL pública expuesta (evitando depender de ngrok u otro túnel).
+
+Un detalle importante descubierto durante la integración: la memoria interna de n8n (`$getWorkflowStaticData`) **no es confiable para guardar el offset de Telegram** bajo triggers de alta frecuencia (advertencia documentada oficialmente por n8n). Por eso el offset se guarda de forma durable en una hoja de cálculo dedicada (`PollingState`) en vez de en memoria.
+
+El flujo real de entrada es:
 
 ```
-Telegram Trigger → Leer Sesión → Router Paso
-                                    ├── menu                    → [Parte A]
-                                    ├── esperando_materia        → [Parte A]
-                                    ├── esperando_fecha          → [Parte A → Parte B]
-                                    └── esperando_confirmacion   → [Parte A → Parte B]
+Trigger Polling (cada 5s)
+   -> Config Bot Token
+   -> Leer Offset                  (lee last_update_id desde la hoja PollingState)
+   -> Preparar Peticion Updates    (arma la URL de getUpdates con ese offset)
+   -> Obtener Updates Telegram     (HTTP Request a api.telegram.org/getUpdates)
+   -> Procesar Updates             (toma UN SOLO update por ciclo, para no mezclar mensajes)
+   -> Avanzar Offset?  --true--> Guardar Offset (persiste el nuevo offset en PollingState)
+                                      -> Hay Mensaje Nuevo?  --true--> Preparar Datos Entrada
+                                                              --false-> (fin del ciclo, era un update sin mensaje)
+                       --false-> (fin del ciclo, no habia nada nuevo)
+
+Preparar Datos Entrada
+   -> Leer Sesiones
+   -> Buscar Mi Sesion   (detecta comandos globales: /start, /consultar, /cancelar)
+   -> Existe Sesion?     (ambas ramas, true y false, continuan igual hacia Router Paso;
+                          la sesion se crea/actualiza mas adelante con appendOrUpdate,
+                          sin necesidad de un paso de creacion separado)
+   -> Router Paso
+        - menu                    -> menu de materias
+        - esperando_materia        -> validacion de materia
+        - esperando_fecha          -> validacion de fecha + busqueda de tutor
+        - esperando_confirmacion   -> confirmacion y registro
+        - consultando              -> consulta de tutorias propias
+        - cancelando               -> cancelacion de tutoria activa
 ```
 
-![Workflow completo integrado](imagenes/00_workflow_completo.png)
-*Captura del workflow final ya integrado, Parte A + Parte B (agregar cuando esté unido).*
+> Si en el futuro se despliega en un servidor con dominio o IP pública, se recomienda migrar a `Telegram Trigger` nativo (webhook), lo que elimina la necesidad de los nodos `Config Bot Token`, `Leer Offset`, `Preparar Peticion Updates`, `Obtener Updates Telegram`, `Procesar Updates`, `Avanzar Offset?`, `Guardar Offset`, `Hay Mensaje Nuevo?` y la hoja `PollingState`.
+
+![Workflow completo integrado](images)
 
 ## Base de datos (Google Sheets)
 
 Archivo compartido: `TutorBot_DB` — mismo `documentId` usado en todos los nodos de Sheets del proyecto.
 
-| Hoja | Responsable | Descripción |
+| Hoja | Responsable original | Descripción |
 |---|---|---|
 | `TUTORES` | Julian Pinto Uribe | Catálogo de tutores, materias que dan, estado |
 | `SESSIONS` | Julian Pinto Uribe | Estado de la conversación por usuario |
 | `DISPONIBILIDAD` | Heiling Leon | Horarios de cada tutor y si están libres/ocupados |
 | `TUTORIAS` | Heiling Leon | Registro de tutorías asignadas |
+| `Reportes` | Heiling Leon | Reporte diario automático de actividad (agregado en la integración final) |
+| `PollingState` | Heiling Leon | Guarda el offset de Telegram de forma durable (agregado por la implementación de polling; no forma parte del modelo de datos original del PDF) |
 
----
+> **Nota de formato:** las columnas numéricas de `Reportes` (`total_tutorias`, `solicitadas`, `asignadas`, `confirmadas`, `finalizadas`, `canceladas`, `sin_tutor`) deben tener formato **Número** en Google Sheets. Si Sheets las autoformatea como Fecha/Hora, un valor como `1` se muestra como `31/dic/1899` y `0` como `0:00` — el dato guardado es correcto, es solo un problema de formato de celda (`Formato → Número → Número`).
 
-## Parte A (Julian Pinto Uribe) — Entrada y captura de datos
+### `TUTORES`
 
-*(Pendiente de documentar por Julian Pinto Uribe: configuración del bot en Telegram, estructura de `TUTORES` y `SESSIONS`, flujo del menú de materias, selección de materia, y validación de fecha.)*
+| Columna | Descripción |
+|---|---|
+| `id_tutor` | Identificador único del tutor |
+| `nombre` | Nombre del tutor |
+| `especialidad_materias` | Materias que dicta (texto, se busca por coincidencia de subcadena) |
+| `estado` | `Activo` / `Inactivo` |
+| `telegram_chat_id` | **Columna necesaria** para poder notificarle al tutor por Telegram cuando se le asigna una tutoría |
 
-### Hojas de Sheets
+### `SESSIONS`
 
-*(Julian Pinto Uribe: pega aquí la estructura final de `TUTORES` y `SESSIONS` con columnas y ejemplo de datos)*
+| Columna | Descripción |
+|---|---|
+| `telegram_user` | Chat ID de Telegram del estudiante (identificador de sesión). **Debe formatearse como texto plano en la hoja**, no como número — Google Sheets lo autoconvierte y rompe la coincidencia de filas en las operaciones `appendOrUpdate`. |
+| `pantalla_actual` | Pantalla mostrada al usuario |
+| `paso_actual` | Paso del wizard: `menu`, `esperando_materia`, `esperando_fecha`, `esperando_confirmacion`, `consultando`, `cancelando` |
+| `datos_parciales` | JSON serializado con los datos capturados hasta el momento (materia, fecha, tutor propuesto, etc.) |
 
-![Hoja TUTORES](imagenes/01_hoja_tutores.png)
-![Hoja SESSIONS](imagenes/02_hoja_sessions.png)
+> Todas las escrituras sobre esta hoja usan la operación `appendOrUpdate` (no `update`), para garantizar que la fila se cree si el usuario es nuevo y se actualice si ya existe — con `update` puro, un estudiante sin fila previa nunca queda registrado.
 
-### Nodos del flujo
-
-*(Julian Pinto Uribe: lista de nodos, qué hace cada uno, y capturas de pantalla)*
-
-![Flujo menú y captura de datos](imagenes/03_flujo_parte_a.png)
-*Captura del tramo de nodos de Parte A en n8n (Telegram Trigger → Router Paso → menú → materia → fecha).*
-
-![Nodo Router Paso](imagenes/04_router_paso.png)
-*Configuración del nodo Switch que dirige según `paso_actual`.*
-
-### Cómo probar esta parte
-
-*(Julian Pinto Uribe: instrucciones paso a paso para correr y verificar el menú, la selección de materia, y la validación de fecha)*
-
-![Prueba menú de materias](imagenes/05_prueba_menu.png)
-![Prueba validación de fecha](imagenes/06_prueba_fecha.png)
-
----
-
-## Parte B (Heiling Leon) — Motor de asignación y confirmación
-
-Responsable de todo lo que ocurre después de que el estudiante entrega una **materia** y una **fecha válida**: buscar un tutor disponible, proponerlo, confirmar la tutoría y dejar todo registrado.
-
-### Hojas de Sheets
-
-**`DISPONIBILIDAD`**
+### `DISPONIBILIDAD`
 
 | Columna | Descripción |
 |---|---|
@@ -103,65 +116,86 @@ Responsable de todo lo que ocurre después de que el estudiante entrega una **ma
 | `hora_inicio` / `hora_fin` | Formato `HH:MM`, 24 horas |
 | `estado` | `Libre` u `Ocupado` |
 
-**`TUTORIAS`**
+### `TUTORIAS`
 
 | Columna | Descripción |
 |---|---|
-| `id_tutoria` | Identificador único (generado con `Date.now()`) |
-| `id_estudiante` | `telegram_user` del estudiante |
+| `id_tutoria` | Identificador único (generado con `$now.toMillis()`) |
+| `id_estudiante` | `telegram_user` del estudiante (mismo cuidado de formato de texto que en `SESSIONS`) |
 | `id_tutor` | Tutor asignado |
-| `materia` / `fecha` / `hora` | Datos de la tutoría confirmada |
+| `materia` / `fecha` / `hora` | Datos de la tutoría |
 | `estado` | Ver ciclo de estados abajo |
 
-### Ciclo de estados de una tutoría
+### `PollingState`
 
-| Estado | ¿Quién lo genera? | Descripción |
+| Columna | Descripción |
+|---|---|
+| `id` | Fijo en `1` (una sola fila de control) |
+| `last_update_id` | Último `update_id` de Telegram ya procesado. Arranca en `0`. |
+
+## Ciclo de estados de una tutoría (confirmado en la integración final)
+
+| Estado | ¿Cuándo se genera? | Nodo responsable |
 |---|---|---|
-| `Solicitada` | Parte A | Se crea cuando el estudiante pide una tutoría (antes de encontrar tutor) |
-| `Asignada` | Parte B | Se marca cuando el sistema encuentra tutor y horario libre, y el estudiante confirma |
-| `Confirmada` |  Parte A | *(Pendiente definir: puede ser el mismo momento que "Asignada", o un paso extra donde el tutor confirma manualmente — a coordinar con Julian Pinto Uribe)* |
-| `Finalizada` | Parte A | Se marca cuando la tutoría ya se llevó a cabo (posiblemente vía el flujo de "consultar estado" o un recordatorio posterior) |
-| `Cancelada` | Parte B | Se marca cuando el estudiante rechaza la propuesta de tutor/horario |
+| `Solicitada` | Al validar la fecha y antes de buscar tutor | `Registrar Solicitud (Solicitada)` |
+| `Asignada` | Cuando el motor de matching encuentra tutor y horario libre, y se envía la propuesta al estudiante | `Actualizar Tutoria (Asignada)` |
+| `Sin_Tutor_Disponible` | Cuando no hay ningún tutor con esa materia y horario libre ese día | `Actualizar Tutoria (Sin Tutor)` |
+| `Confirmada` | Cuando el estudiante confirma la propuesta (responde "sí") | `Actualizar Tutoria (Confirmada)` |
+| `Cancelada` | Cuando el estudiante rechaza la propuesta ("no"), o cuando cancela una tutoría ya confirmada con `/cancelar` | `Actualizar Tutoria (Rechazada)` / `Cancelar Tutoria (Sheet)` |
+| `Finalizada` | Automáticamente, cuando una tutoría `Confirmada` tiene fecha anterior a hoy (job diario 20:00) | `Marcar Finalizadas` |
 
-> Nota: `TUTORES` necesita una columna adicional `telegram_chat_id` (chat_id real de cada tutor en Telegram), usada para notificarle cuando se le asigna una tutoría.
+> Nota de nomenclatura: el nodo que registra el rechazo del estudiante se llama `Actualizar Tutoria (Rechazada)` pero internamente guarda el estado como `Cancelada` (no existe un estado `Rechazada` separado en la hoja). Se deja documentado para evitar confusión al leer el JSON.
 
-![Hoja DISPONIBILIDAD](images/1.png)
-![Hoja TUTORIAS](images/2.png)
+## Flujo "Solicitar Tutoría" (Julian Pinto Uribe + Heiling Leon)
 
-### Flujo de nodos (Bloque 1 — Matching)
+1. **Materia:** el bot lista las materias disponibles (`Leer Tutores (menu)` -> `Listar Materias Unicas` -> `Enviar Menu Materias`). Se guarda la elección en `SESSIONS` (`Guardar Materia Elegida`, validada por `Materia Valida?`).
+2. **Horarios disponibles:** antes de pedir la fecha, el bot muestra los tutores activos de esa materia junto con sus horarios `Libre` en `DISPONIBILIDAD` (`Leer Tutores (Horarios)` -> `Leer Disponibilidad (Horarios)` -> `Formatear Horarios Disponibles` -> `Enviar Horarios Disponibles`), agrupados por tutor (ej: `Ana Perez: Lunes 14:00-15:00`). Esto le da al estudiante contexto real antes de escribir una fecha, en vez de que la adivine a ciegas.
+3. **Fecha:** el estudiante escribe la fecha en formato `YYYY-MM-DD`. El nodo `Validar Fecha` comprueba que sea una fecha calendario real y que no sea anterior a hoy.
+4. **Búsqueda:** `Preparar Datos Busqueda` calcula el día de la semana a partir de la fecha; `Match Tutor Disponible` cruza tutores activos de esa materia con disponibilidad libre ese día.
+5. **Propuesta y confirmación:** si hay match (`Tutor Encontrado?`), se envía la propuesta (`Enviar Propuesta`) y se espera confirmación (`esperando_confirmacion`, guardada por `Guardar Sesion Propuesta`). Si el estudiante confirma, se marca `Confirmada`, se ocupa el horario (`Actualizar Disponibilidad Ocupado`) y se notifica a ambas partes (`Confirmar Estudiante`, `Notificar Tutor`).
+6. **Sin match:** si no hay tutor disponible para esa fecha puntual, se marca `Sin_Tutor_Disponible`, se avisa al estudiante (`Sin Tutores Disponibles`) y la sesión **conserva la materia ya elegida**, quedando lista para que el estudiante escriba directamente otra fecha sin tener que repetir la selección de materia (`Reset Sesion (Sin Tutor)`).
 
-1. **`Leer Tutores`** — Google Sheets, Get Row(s), trae toda la hoja `TUTORES`.
-2. **`Leer Disponibilidad`** — Google Sheets, Get Row(s), trae toda la hoja `DISPONIBILIDAD`.
-3. **`Match Tutor Disponible`** — Code (JavaScript). Filtra tutores activos que dan la materia solicitada, cruza contra disponibilidad libre en el día correspondiente, y devuelve el mejor match (o `encontrado: false` si no hay).
-4. **`Tutor Encontrado?`** — IF, evalúa `encontrado === true`.
-   - **True** → `Enviar Propuesta` (Telegram) → `Guardar Sesion Propuesta` (actualiza `SESSIONS` a `esperando_confirmacion`, guardando los datos del tutor propuesto en `datos_parciales`).
-   - **False** → `Sin Tutores Disponibles` (Telegram).
+Un estudiante puede solicitar más de una tutoría: escribir `/start` en cualquier momento (incluso con una tutoría ya confirmada) reinicia el wizard desde el menú de materias.
 
-![Nodos Bloque 1 - Matching](images/3.png)
+## Flujo "Consultar mis tutorías" (integrado en la versión final)
 
-### Flujo de nodos (Bloque 2 — Confirmación)
+El estudiante escribe `/consultar` o "mis tutorias" en cualquier momento (comando global reconocido por `Buscar Mi Sesion`, que interrumpe el paso actual). El flujo lee sus tutorías (`Leer Tutorias (Consultar)`), las formatea en un mensaje legible (`Formatear Mis Tutorias`) y las envía (`Enviar Mis Tutorias`), reseteando la sesión al menú principal.
 
-1. **`Interpretar Confirmacion`** — recibe la respuesta del estudiante (sí/no) junto con los datos guardados en `datos_parciales`.
-2. **`Confirma?`** — IF, evalúa la respuesta.
-   - **True** → `Crear Tutoria` (append en `TUTORIAS`, estado `Asignada`) → `Actualizar Disponibilidad Ocupado` (marca el `id_dispo` usado como `Ocupado`) → `Confirmar Estudiante` (Telegram) → `Notificar Tutor` (Telegram, usando `telegram_chat_id` del tutor) → `Reset Sesion B` (vuelve `SESSIONS` a `menu`).
-   - **False** → `Cancelado` (Telegram) → `Reset Sesion C` (vuelve `SESSIONS` a `menu`).
+## Flujo "Cancelar tutoría" (integrado en la versión final)
 
-![Nodos Bloque 2 - Confirmación](images/4.png)
+El estudiante escribe `/cancelar`. El sistema busca si tiene una tutoría activa (`Buscar Tutoria Activa` -> `Hay Tutoria Activa?`):
+- **Sí tiene:** se marca como `Cancelada` (`Cancelar Tutoria (Sheet)`), se libera el horario en `DISPONIBILIDAD` (`Liberar Disponibilidad (Cancelar)`) y se confirma al estudiante (`Confirmar Cancelacion`).
+- **No tiene:** se le informa que no hay ninguna tutoría activa para cancelar (`Sin Tutoria Para Cancelar`).
 
-### Lógica clave — código de matching
+## Automatizaciones programadas (agregadas en la integración final)
+
+| Trigger | Horario | Función |
+|---|---|---|
+| `Trigger Diario (20:00)` | 20:00 diario | Marca como `Finalizada` toda tutoría `Confirmada` con fecha ya pasada (`Filtrar Tutorias A Finalizar` -> `Marcar Finalizadas`), y genera el reporte de actividad del día (`Generar Reporte de Actividad` -> `Guardar Reporte (hoja Reportes)`) con el conteo de tutorías por estado. `Guardar Reporte` usa `appendOrUpdate` sobre `fecha_reporte`, así que si el job corre más de una vez el mismo día (por ejemplo al probarlo manualmente), actualiza la fila existente en vez de duplicarla. |
+| `Trigger Recordatorios` | 11:00 diario | Busca tutorías `Confirmada` para el día siguiente y envía recordatorio tanto al estudiante como al tutor (`Preparar Recordatorios` -> `Recordar Estudiante` / `Recordar Tutor`). |
+
+## Lógica clave — código de matching (versión final integrada)
 
 ```javascript
-const sesion = $('Simular Datos Parte A').first().json; // en integración: dato real de Parte A
+// Recuperamos los datos de la solicitud (materia, fecha, dia_semana, id_tutoria)
+const sesion = { ...$('Preparar Datos Busqueda').first().json, id_tutoria: $('Registrar Solicitud (Solicitada)').first().json.id_tutoria };
+
+// Filtramos tutores activos que dicten la materia solicitada
 const tutores = $('Leer Tutores').all().map(i => i.json)
   .filter(t => t.estado === 'Activo' && (t.especialidad_materias || '').includes(sesion.materia));
+
 const disponibilidad = $input.all().map(i => i.json);
 const tutorIds = tutores.map(t => t.id_tutor);
+
+// Buscamos un slot libre de alguno de esos tutores, ese dia
 const libre = disponibilidad.find(d =>
   tutorIds.includes(d.id_tutor) &&
   d.dia_semana === sesion.dia_semana &&
   d.estado === 'Libre'
 );
-const tutor = tutores.find(t => t.id_tutor === (libre ? libre.id_tutor : null));
+
+const tutor = libre ? tutores.find(t => t.id_tutor === libre.id_tutor) : null;
+
 return [{
   json: {
     ...sesion,
@@ -175,60 +209,64 @@ return [{
 }];
 ```
 
-### Cómo se probó (desarrollo aislado)
+## Cómo se probó (desarrollo aislado, previo a la integración)
 
-Como esta parte necesita `materia` y `fecha` que en el flujo real entrega Parte A, se desarrolló y probó de forma independiente usando un `Manual Trigger` + nodo `Set` que simula esos datos, permitiendo construir y validar todo el motor sin esperar a que la otra mitad estuviera lista.
+Antes de integrarse, el motor de asignación (Parte B) se desarrolló y probó de forma independiente usando un `Manual Trigger` + nodo `Set` que simulaba `materia`/`fecha` entregadas por Parte A. Casos cubiertos:
 
-Casos probados:
 - Match exitoso (tutor y horario libre encontrados).
 - Sin match (materia/día sin disponibilidad).
 - Confirmación aceptada (registro completo en `TUTORIAS` + notificaciones).
 - Confirmación rechazada (cancelación + reseteo de sesión).
-- Match con distintos tutores/horarios (no solo el primer caso de prueba).
+- Match con distintos tutores/horarios.
 
-### Capturas de pantalla
+Tras la integración, estos nodos de simulación fueron eliminados y reemplazados por la conexión real desde `Router Paso` (ver diagrama de arquitectura).
 
-![Match exitoso - tutor encontrado](images/5.png)
+**Pruebas de integración end-to-end** (bot real vía Telegram, contra Google Sheets real): se validó el flujo completo `/start` → selección de materia → fecha válida → propuesta de tutor → confirmación → notificación a estudiante y tutor, confirmando además que el horario queda correctamente marcado `Ocupado` en `DISPONIBILIDAD` tras la confirmación.
 
-![Sin tutores disponibles](imagenes/12_sin_tutores.png)
-*Rama false del IF Tutor Encontrado?, caso sin match.*
+## Instalación y ejecución
 
-![Confirmación aceptada](imagenes/13_confirmacion_aceptada.png)
-*Mensajes de Telegram recibidos: confirmación al estudiante y notificación al tutor.*
+### 1. Requisitos previos
+- Docker y Docker Compose.
+- Cuenta de Google con acceso al Google Sheets `TutorBot_DB`.
+- Bot de Telegram creado con [@BotFather](https://t.me/BotFather).
 
-![Registro en TUTORIAS](imagenes/14_fila_tutorias.png)
-*Fila nueva creada en la hoja TUTORIAS tras confirmar.*
+### 2. Clonar el repositorio
+```bash
+git clone https://github.com/<usuario>/Proyecto_TutorBot_ApellidoNombre.git
+cd Proyecto_TutorBot_ApellidoNombre
+```
 
-![Disponibilidad actualizada](imagenes/15_disponibilidad_ocupado.png)
-*Fila en DISPONIBILIDAD cambiando de Libre a Ocupado.*
+### 3. Importar el workflow
+`Workflows` -> `Import from File` -> seleccionar el `.json` del repositorio.
 
-![Confirmación rechazada](imagenes/16_confirmacion_rechazada.png)
-*Mensaje "Solicitud cancelada" y sesión reseteada.*
+### 4. Configurar credenciales en n8n
+El JSON no incluye secretos (solo referencias `id`/`name`). Crear manualmente en `Credentials`:
 
----
+| Credencial | Tipo | Usada por |
+|---|---|---|
+| `Telegram account 2` | Telegram API | Todos los nodos de envío de mensajes |
+| `Google Sheets account` | Google Sheets OAuth2 | Todos los nodos de lectura/escritura sobre `TutorBot_DB` |
 
-## Integración de ambas partes
+### 5. Configurar el token del bot para el polling
+Abrir el nodo **`Config Bot Token`** y pegar el token real entregado por BotFather en el campo `bot_token`.
 
-Al unir los dos flujos:
+### 6. Preparar la hoja `PollingState`
+Crear una hoja llamada exactamente `PollingState` con columnas `id`, `last_update_id`, y una fila de datos: `id = 1`, `last_update_id = 0`.
 
-1. Se elimina el `Manual Trigger` y los nodos `Simular Datos Parte A` / `Simular Confirmacion` de Parte B.
-2. La salida de la rama `esperando_fecha` (fecha validada) del `Router Paso` de Parte A se conecta directo a `Leer Tutores` de Parte B.
-3. La salida de la rama `esperando_confirmacion` del `Router Paso` de Parte A se conecta directo a `Interpretar Confirmacion` / `Confirma?` de Parte B.
-4. El resto de los nodos de Parte B no cambia.
+### 7. Activar el workflow
+Botón **Publish** para que el polling y los triggers programados comiencen a correr.
 
-## Pendientes del proyecto
+### 8. Probar
+Enviar `/start` al bot desde Telegram y seguir el menú. Probar también `/consultar` y `/cancelar`.
 
-- [ ] Integración final de ambos bloques en un solo workflow.
-- [ ] Flujo de recordatorios automáticos (Schedule Trigger).
-- [ ] Flujo de reportes automáticos (Schedule Trigger).
-- [ ] Pruebas de extremo a extremo con el `Telegram Trigger` real.
-- [ ] Exportar el `.json` final del workflow.
+## Capturas del flujo
+ 
 
-## Entrega
+## Limitaciones conocidas
 
-Checklist según los requisitos del proyecto:
-
-- [ ] Repositorio de GitHub con nombre `Proyecto_TutorBot_ApellidoNombre` ⚠️ *(pendiente: definir apellido/nombre a usar y crear el repo)*
-- [x] Archivo `README.md` con instrucciones y capturas del flujo *(este archivo — faltan las capturas, ver carpeta `imagenes/`)*
-- [ ] Archivo `.json` con el flujo completo de n8n ⚠️ *(pendiente: exportar una vez integradas Parte A y Parte B)*
-- [ ] Acceso compartido al Google Sheets de base de datos ⚠️ *(pendiente: confirmar que el trainer/profesor tenga acceso, no solo los integrantes)*
+- **Recepción por polling:** el bot consulta Telegram cada 5 segundos en vez de usar un webhook en tiempo real (`Telegram Trigger`). Es la opción elegida por no exponer una URL pública en el entorno de desarrollo local. El offset se guarda en la hoja `PollingState` (no en memoria de n8n) porque `$getWorkflowStaticData` no es confiable con triggers de alta frecuencia.
+- **Reserva del cupo de disponibilidad:** el horario se marca como `Ocupado` recién al momento de la **confirmación** del estudiante, no al momento de la propuesta inicial. Si dos estudiantes solicitan el mismo tutor y horario de forma simultánea antes de que el primero confirme, ambos podrían recibir la misma propuesta. Punto de mejora para una siguiente iteración (por ejemplo, reservar el slot desde el momento en que se propone).
+- **Coincidencia de materia por texto:** la búsqueda de tutor por materia usa coincidencia de subcadena sobre `especialidad_materias`, por lo que nombres de materias muy similares podrían generar falsos positivos ocasionales.
+- **Sin bloqueo de solicitudes duplicadas:** el bot no impide que un estudiante solicite varias tutorías de la misma materia; cada solicitud se procesa de forma independiente.
+- **Conteo de tutores en el paso de horarios:** el nodo `Leer Tutores (Horarios)` lee todas las filas de `TUTORES` sin filtrar filas vacías; si la hoja tiene filas en blanco por debajo de los datos, `n8n` las cuenta igual (no afecta el resultado mostrado al estudiante, pero puede verse un número de "items" mayor al esperado en el panel de ejecución de n8n).
+- **Nomenclatura del nodo `Actualizar Tutoria (Rechazada)`:** por consistencia con el resto del workflow, guarda el estado como `Cancelada` en vez de un estado `Rechazada` separado; documentado arriba para evitar confusión.
