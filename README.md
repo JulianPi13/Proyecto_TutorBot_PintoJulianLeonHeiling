@@ -270,3 +270,25 @@ Enviar `/start` al bot desde Telegram y seguir el menú. Probar también `/consu
 - **Sin bloqueo de solicitudes duplicadas:** el bot no impide que un estudiante solicite varias tutorías de la misma materia; cada solicitud se procesa de forma independiente.
 - **Conteo de tutores en el paso de horarios:** el nodo `Leer Tutores (Horarios)` lee todas las filas de `TUTORES` sin filtrar filas vacías; si la hoja tiene filas en blanco por debajo de los datos, `n8n` las cuenta igual (no afecta el resultado mostrado al estudiante, pero puede verse un número de "items" mayor al esperado en el panel de ejecución de n8n).
 - **Nomenclatura del nodo `Actualizar Tutoria (Rechazada)`:** por consistencia con el resto del workflow, guarda el estado como `Cancelada` en vez de un estado `Rechazada` separado; documentado arriba para evitar confusión.
+
+## Link del Google sheets
+
+https://docs.google.com/spreadsheets/d/1pmz3UwQSOmPZssZOFpx3-R3m7_XXLMIQha1fzln2Nww/edit?usp=sharing
+
+## Hoja PolingState
+![Hoja PolingState ](assets/imagen1.png)
+
+## Hoja Reportes
+![Hoja Reportes](assets/imagen2.png)
+
+## Hoja Tutorias
+![Hoja Tutorias](assets/imagen3.png)
+
+## Hoja Sessions
+![Hoja Sessions](assets/imagen4.png)
+
+## Hoja Tutores
+![Hoja Tutores](assets/imagen5.png)
+
+## Hoja Disponibilidad
+![Hoja Disponibilidad](assets/imagen6.png)
